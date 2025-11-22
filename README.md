@@ -30,4 +30,4 @@ There will be 7 classified folders where specific images are kept:
    1. If you want to use `HAM10000`, download the dataset. Here is the [link](https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000)
    2. Extract the dataset files into `src/data/HAM10000` folder
    3. Run `prepare_ham10000_folders.py` in `src/scripts` folder
-2.Run `skin_cancer_detector.py` 
+2. Run `skin_cancer_detector.py` 

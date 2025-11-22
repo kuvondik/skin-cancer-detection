@@ -1,6 +1,3 @@
-# skin_cancer_project.py
-# A complete training + evaluation + explainability pipeline for EARLY DIAGNOSIS OF SKIN CANCER (HAM10000)
-
 import os
 import csv
 import json
@@ -27,13 +24,11 @@ from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# --------------------
 # CONFIG
-# --------------------
 @dataclass
 class Config:
-    data_root: str = "./data/HAM10000_custom"  # folder structure: data_root/class_name/*.jpg
-    outputs: str = "./outputs"
+    data_root: str = "data/HAM10000_custom/"  # folder structure: data_root/class_name/*.jpg
+    outputs: str = "outputs/"
     img_size: int = 224
     batch_size: int = 32
     num_workers: int = 4
@@ -65,9 +60,8 @@ torch.manual_seed(CFG.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(CFG.seed)
 
-# --------------------
+
 # DATA
-# --------------------
 CLASS_NAMES = ["AKIEC","BCC","BKL","DF","MEL","NV","VASC"]  # standard 7 classes
 
 def get_transforms(img_size: int):
@@ -185,9 +179,7 @@ def build_dataloaders(cfg: Config):
 
     return train_loader, val_loader, test_loader, class_weights, full_ds_eval.classes
 
-# --------------------
 # MODEL
-# --------------------
 class EfficientNetB0Classifier(nn.Module):
     def __init__(self, num_classes: int, dropout: float = 0.3, label_smoothing: float = 0.0):
         super().__init__()
@@ -202,9 +194,8 @@ class EfficientNetB0Classifier(nn.Module):
     def forward(self, x):
         return self.backbone(x)
 
-# --------------------
+
 # TRAINING UTILS
-# --------------------
 def accuracy_from_logits(logits, y):
     preds = logits.argmax(dim=1)
     return (preds == y).float().mean().item()
@@ -288,9 +279,7 @@ def save_params_table(cfg: Config, outdir: str, best_epoch: int):
     df = pd.DataFrame(params)
     df.to_csv(os.path.join(outdir, "parameter_selection.csv"), index=False)
 
-# --------------------
 # EVALUATION (REPORTS, CONFUSION, ROC, t-SNE)
-# --------------------
 @torch.no_grad()
 def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: List[str], outdir: str):
     os.makedirs(outdir, exist_ok=True)
@@ -362,9 +351,7 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
     except Exception as e:
         print(f"[WARN] t-SNE failed: {e}")
 
-# --------------------
 # GRAD-CAM
-# --------------------
 class GradCAM:
     """
     Minimal Grad-CAM for EfficientNet last conv stage.
@@ -468,9 +455,7 @@ def gradcam_gallery(model, loader, class_names, outdir, num_images=6, device=Non
             break
     gradcam.remove_hooks()
 
-# --------------------
-# LIME (optional)
-# --------------------
+# LIME
 def lime_explain_samples(model, loader, class_names, outdir, num_images=3, device=None):
     try:
         from lime import lime_image
@@ -529,9 +514,7 @@ def lime_explain_samples(model, loader, class_names, outdir, num_images=3, devic
         if picked >= num_images:
             break
 
-# --------------------
 # MAIN
-# --------------------
 def main(cfg: Config):
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -621,7 +604,7 @@ def main(cfg: Config):
     # Grad-CAM visualizations
     gradcam_gallery(model, test_loader, class_names, cfg.outputs, num_images=cfg.gradcam_num_samples, device=device)
 
-    # LIME (optional)
+    # LIME
     if cfg.lime_num_samples > 0:
         lime_explain_samples(model, test_loader, class_names, cfg.outputs, num_images=cfg.lime_num_samples, device=device)
 

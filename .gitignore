@@ -2,10 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.idea/
+.vscode/
 .env
-venv/
-myenv/
 .env/
+.venv/
+myenv/
 *.log
 .DS_Store
 src/data/

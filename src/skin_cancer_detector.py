@@ -1,8 +1,5 @@
 import os
-import csv
 import json
-import time
-import math
 import copy
 import random
 import numpy as np
@@ -27,8 +24,8 @@ from tqdm import tqdm
 # CONFIG
 @dataclass
 class Config:
-    data_root: str = "data/HAM10000_custom/"  # folder structure: data_root/class_name/*.jpg
-    outputs: str = "outputs/"
+    data_root: str = "./data/HAM10000_small/"  # folder structure: data_root/class_name/*.jpg
+    outputs: str = "./outputs/"
     img_size: int = 224
     batch_size: int = 32
     num_workers: int = 4

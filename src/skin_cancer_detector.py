@@ -2,15 +2,17 @@ import os
 import json
 import copy
 import random
+from dataclasses import dataclass
+from typing import List, Optional
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as nn_func
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch import Tensor
 from torchvision import transforms, models
 from torchvision.datasets import ImageFolder
 from PIL import Image
@@ -18,14 +20,17 @@ from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve
 from sklearn.preprocessing import label_binarize
 from sklearn.manifold import TSNE
+
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+CLASS_NAMES = ["AKIEC","BCC","BKL","DF","MEL","NV","VASC"]  # standard 7 classes
 
 # CONFIG
 @dataclass
 class Config:
-    data_root: str = "./data/HAM10000_small/"  # folder structure: data_root/class_name/*.jpg
-    outputs: str = "./outputs/"
+    data_root: str = "./data/HAM10000_custom"  # folder structure: data_root/class_name/*.jpg
+    outputs: str = "./outputs"
     img_size: int = 224
     batch_size: int = 32
     num_workers: int = 4
@@ -43,8 +48,6 @@ class Config:
     test_split: float = 0.15
     use_class_weights: bool = False
     save_best_model: bool = True
-    gradcam_num_samples: int = 6   # how many test images to visualize with Grad-CAM
-    lime_num_samples: int = 5      # set >0 only if lime is installed; e.g., 5
 
 CFG = Config()
 
@@ -57,24 +60,22 @@ torch.manual_seed(CFG.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(CFG.seed)
 
-
 # DATA
-CLASS_NAMES = ["AKIEC","BCC","BKL","DF","MEL","NV","VASC"]  # standard 7 classes
-
 def get_transforms(img_size: int):
     train_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),    # small rotation only
+        transforms.RandomRotation(10),  # small rotation only
         transforms.ColorJitter(brightness=0.05, contrast=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
+                             std=[0.229, 0.224, 0.225]),
     ])
     eval_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
     return train_tf, eval_tf
 
@@ -95,9 +96,9 @@ class SubsetFolder(torch.utils.data.Dataset):
         self.classes = folder_ds.classes
         self.class_to_idx = folder_ds.class_to_idx
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.indices)
-    
+
     def __getitem__(self, i):
         x, y = self.ds[self.indices[i]]
         return x, y
@@ -107,21 +108,23 @@ def build_dataloaders(cfg: Config):
 
     # Base dataset for splitting
     base_ds_for_split = ImageFolder(
-        cfg.data_root, 
+        cfg.data_root,
         transform=transforms.Compose([
-            transforms.Resize((cfg.img_size, cfg.img_size)), 
+            transforms.Resize((cfg.img_size, cfg.img_size)),
             transforms.ToTensor()
         ])
     )
     full_ds_train = ImageFolder(cfg.data_root, transform=train_tf)
-    full_ds_eval  = ImageFolder(cfg.data_root, transform=eval_tf)
+    full_ds_eval = ImageFolder(cfg.data_root, transform=eval_tf)
 
     n = len(base_ds_for_split)
-    train_idx, val_idx, test_idx = split_indices(n, cfg.train_split, cfg.val_split, cfg.test_split)
+    train_idx, val_idx, test_idx = split_indices(
+        n, cfg.train_split, cfg.val_split, cfg.test_split
+    )
 
     ds_train = SubsetFolder(full_ds_train, train_idx)
-    ds_val   = SubsetFolder(full_ds_eval,  val_idx)
-    ds_test  = SubsetFolder(full_ds_eval,  test_idx)
+    ds_val = SubsetFolder(full_ds_eval, val_idx)
+    ds_test = SubsetFolder(full_ds_eval, test_idx)
 
     # Class weights based on train set distribution
     class_counts = np.zeros(len(base_ds_for_split.classes), dtype=np.int64)
@@ -142,7 +145,11 @@ def build_dataloaders(cfg: Config):
         for i in train_idx:
             _, y = base_ds_for_split[i]
             sample_weights.append(class_weights[y].item())
-        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
         train_loader = DataLoader(
             ds_train,
             batch_size=cfg.batch_size,
@@ -166,6 +173,7 @@ def build_dataloaders(cfg: Config):
         num_workers=cfg.num_workers,
         pin_memory=False
     )
+
     test_loader = DataLoader(
         ds_test,
         batch_size=cfg.batch_size,
@@ -191,9 +199,8 @@ class EfficientNetB0Classifier(nn.Module):
     def forward(self, x):
         return self.backbone(x)
 
-
 # TRAINING UTILS
-def accuracy_from_logits(logits, y):
+def accuracy_from_logits(logits: Tensor, y: Tensor) -> float:
     preds = logits.argmax(dim=1)
     return (preds == y).float().mean().item()
 
@@ -210,7 +217,7 @@ def train_one_epoch(model, loader, optimizer, device, criterion, scheduler=None)
         if scheduler is not None:
             scheduler.step()
         running_loss += loss.item() * xb.size(0)
-        running_acc  += accuracy_from_logits(out, yb) * xb.size(0)
+        running_acc += accuracy_from_logits(out, yb) * xb.size(0)
     n = len(loader.dataset)
     return running_loss / n, running_acc / n
 
@@ -224,21 +231,22 @@ def eval_one_epoch(model, loader, device, criterion):
         out = model(xb)
         loss = criterion(out, yb)
         running_loss += loss.item() * xb.size(0)
-        running_acc  += accuracy_from_logits(out, yb) * xb.size(0)
+        running_acc += accuracy_from_logits(out, yb) * xb.size(0)
         all_logits.append(out.cpu())
         all_targets.append(yb.cpu())
     n = len(loader.dataset)
-    logits  = torch.cat(all_logits)
+    logits = torch.cat(all_logits)
     targets = torch.cat(all_targets)
     return running_loss / n, running_acc / n, logits, targets
 
 def plot_training_curves(history, outdir):
     os.makedirs(outdir, exist_ok=True)
     # Loss
-    plt.figure(figsize=(7,5))
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_loss"], label="Train Loss")
-    plt.plot(history["val_loss"],   label="Val Loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.plot(history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.title("Training/Validation Loss")
     plt.legend()
     plt.tight_layout()
@@ -246,10 +254,11 @@ def plot_training_curves(history, outdir):
     plt.close()
 
     # Accuracy
-    plt.figure(figsize=(7,5))
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_acc"], label="Train Accuracy")
-    plt.plot(history["val_acc"],   label="Val Accuracy")
-    plt.xlabel("Epoch"); plt.ylabel("Accuracy")
+    plt.plot(history["val_acc"], label="Val Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
     plt.title("Training/Validation Accuracy")
     plt.legend()
     plt.tight_layout()
@@ -269,7 +278,7 @@ def save_params_table(cfg: Config, outdir: str, best_epoch: int):
         "Dropout": [cfg.dropout],
         "Label smoothing": [cfg.label_smoothing],
         "Class weights": ["Yes (inverse freq)" if cfg.use_class_weights else "No"],
-        "Augmentations": ["Flip, resize, normalize"],
+        "Augmentations": ["Flip, small rotation, light color jitter"],
         "Early stopping patience": [cfg.patience],
         "Best epoch": [best_epoch],
     }
@@ -283,13 +292,18 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
     y_true = targets.numpy()
     y_pred = logits.argmax(1).numpy()
 
-    report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True, zero_division=0)
+    report = classification_report(
+        y_true, y_pred,
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0
+    )
     df = pd.DataFrame(report).transpose()
     df.to_csv(os.path.join(outdir, "results_table.csv"))
 
     # Confusion matrix
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    plt.figure(figsize=(7,6))
+    plt.figure(figsize=(7, 6))
     plt.imshow(cm, interpolation="nearest")
     plt.title("Confusion Matrix")
     plt.colorbar()
@@ -300,28 +314,28 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
     cm_norm = cm / np.clip(cm_sum, 1, None)
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            plt.text(j, i, f"{cm_norm[i,j]:.2f}", ha="center", va="center", fontsize=8)
-    plt.ylabel("True label"); plt.xlabel("Predicted label")
+            plt.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center", fontsize=8)
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "confusion_matrix.png"))
     plt.close()
 
     # ROC (One-vs-Rest)
     y_true_bin = label_binarize(y_true, classes=list(range(len(class_names))))
-    y_score = F.softmax(logits, dim=1).numpy()
-    plt.figure(figsize=(7,5))
-    aucs = {}
+    y_score = nn_func.softmax(logits, dim=1).numpy()
+    plt.figure(figsize=(7, 5))
     for i, name in enumerate(class_names):
         try:
             fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_score[:, i])
             auc_val = roc_auc_score(y_true_bin[:, i], y_score[:, i])
-            aucs[name] = auc_val
             plt.plot(fpr, tpr, label=f"{name} (AUC={auc_val:.3f})")
         except ValueError:
             # class not present in test
             pass
-    plt.plot([0,1],[0,1],"--")
-    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.plot([0, 1], [0, 1], "--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
     plt.title("ROC Curves (OvR)")
     plt.legend(loc="lower right")
     plt.tight_layout()
@@ -335,13 +349,14 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
             init="random", learning_rate="auto", perplexity=30
         )
         Z = tsne.fit_transform(logits.numpy())
-        plt.figure(figsize=(6,6))
+        plt.figure(figsize=(6, 6))
         for i, name in enumerate(class_names):
             mask = y_true == i
-            plt.scatter(Z[mask,0], Z[mask,1], s=10, alpha=0.7, label=name)
+            plt.scatter(Z[mask, 0], Z[mask, 1], s=10, alpha=0.7, label=name)
         plt.title("2D Embedding Visualization (t-SNE)")
-        plt.legend(markerscale=1.5, bbox_to_anchor=(1.05,1), loc="upper left")
-        plt.xlabel("Dim 1"); plt.ylabel("Dim 2")
+        plt.legend(markerscale=1.5, bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "embedding_scatter.png"))
         plt.close()
@@ -350,9 +365,6 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
 
 # GRAD-CAM
 class GradCAM:
-    """
-    Minimal Grad-CAM for EfficientNet last conv stage.
-    """
     def __init__(self, model, target_layer_name="features.6.0.block.0"):
         self.model = model.eval()
         self.target_layer = self._get_target_layer(target_layer_name)
@@ -377,7 +389,7 @@ class GradCAM:
         self.hook_handles.append(self.target_layer.register_full_backward_hook(self._save_gradients))
 
     def remove_hooks(self):
-        for h in self.hook_handles: 
+        for h in self.hook_handles:
             h.remove()
 
     @torch.no_grad()
@@ -400,12 +412,12 @@ class GradCAM:
 
         # Grad-CAM weights
         grads = self.gradients  # [B, C, H, W]
-        acts  = self.activations  # [B, C, H, W]
-        weights = grads.mean(dim=(2,3), keepdim=True) # [B, C, 1, 1]
-        cam = (weights * acts).sum(dim=1, keepdim=True) # [B,1,H,W]
-        cam = F.relu(cam)
-        cam = F.interpolate(
-            cam, size=input_tensor.shape[2:], 
+        acts = self.activations  # [B, C, H, W]
+        weights = grads.mean(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
+        cam = (weights * acts).sum(dim=1, keepdim=True)  # [B,1,H,W]
+        cam = nn_func.relu(cam)
+        cam = nn_func.interpolate(
+            cam, size=input_tensor.shape[2:],
             mode="bilinear", align_corners=False
         )
         cam = cam.squeeze().detach().cpu().numpy()
@@ -414,104 +426,162 @@ class GradCAM:
 
 def denorm_to_numpy(t):
     # inverse of ImageNet normalization
-    mean = torch.tensor([0.485,0.456,0.406])[:,None,None]
-    std  = torch.tensor([0.229,0.224,0.225])[:,None,None]
+    mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
     x = t.cpu() * std + mean
-    x = (x.clamp(0,1) * 255).byte().permute(1,2,0).numpy()
+    x = (x.clamp(0, 1) * 255).byte().permute(1, 2, 0).numpy()
     return x
 
 def overlay_cam(image_np, cam, alpha=0.35):
     heat = plt.cm.jet(cam)[..., :3]  # [H,W,3]
-    heat = (heat*255).astype(np.uint8)
-    overlay = (alpha*heat + (1-alpha)*image_np).astype(np.uint8)
+    heat = (heat * 255).astype(np.uint8)
+    overlay = (alpha * heat + (1 - alpha) * image_np).astype(np.uint8)
     return overlay
 
-def gradcam_gallery(model, loader, class_names, outdir, num_images=6, device=None):
+def gradcam_gallery_all_classes(model, loader, class_names, outdir, device=None):
     os.makedirs(outdir, exist_ok=True)
+
     if device is None:
         device = next(model.parameters()).device
+
     gradcam = GradCAM(model)
-    picked = 0
+
+    # Collect one real image per class
+    samples = {}   # class_idx → image_tensor[1,3,H,W]
+
     for xb, yb in loader:
-        for i in range(xb.size(0)):
-            if picked >= num_images:
+        for img, label in zip(xb, yb):
+            label = int(label)
+            if label not in samples:
+                samples[label] = img.unsqueeze(0)
+            if len(samples) == len(class_names):
                 break
-            img = xb[i:i+1].to(device)
-            cam, pred = gradcam.generate(img)
-            img_np = denorm_to_numpy(xb[i])
-            overlay = overlay_cam(img_np, cam)
-            plt.figure(figsize=(10,4))
-            plt.subplot(1,3,1); plt.imshow(img_np); plt.axis("off"); plt.title("Image")
-            plt.subplot(1,3,2); plt.imshow(cam, cmap="jet"); plt.axis("off"); plt.title("Grad-CAM")
-            plt.subplot(1,3,3); plt.imshow(overlay); plt.axis("off"); plt.title(f"Pred: {class_names[pred]}")
-            plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"gradcam_{picked}.png"))
-            plt.close()
-            picked += 1
-        if picked >= num_images:
+        if len(samples) == len(class_names):
             break
+
+    print(f"Collected {len(samples)} real images (one for each class) for Grad-CAM.")
+
+    # Generate Grad-CAM for each class
+    for class_idx, img in samples.items():
+        img_device = img.to(device)
+
+        # Force Grad-CAM target to this actual class
+        cam, _ = gradcam.generate(img_device, target_class=class_idx)
+
+        # Convert to numpy image
+        img_np = denorm_to_numpy(img.squeeze(0))
+        overlay = overlay_cam(img_np, cam)
+
+        # Plot & save
+        plt.figure(figsize=(10,4))
+        plt.subplot(1,3,1); plt.imshow(img_np); plt.axis("off")
+        plt.title(f"Image ({class_names[class_idx]})")
+
+        plt.subplot(1,3,2); plt.imshow(cam, cmap="jet"); plt.axis("off")
+        plt.title("Grad-CAM")
+
+        plt.subplot(1,3,3); plt.imshow(overlay); plt.axis("off")
+        plt.title("Overlay")
+
+        plt.tight_layout()
+        save_path = os.path.join(outdir, f"gradcam_{class_names[class_idx]}.png")
+        plt.savefig(save_path)
+        plt.close()
+
+        print(f"Saved Grad-CAM for class {class_names[class_idx]} → {save_path}")
+
     gradcam.remove_hooks()
 
 # LIME
-def lime_explain_samples(model, loader, class_names, outdir, num_images=3, device=None):
+def lime_explain_all_classes(model, loader, class_names, outdir, device=None):
     try:
         from lime import lime_image
         from skimage.segmentation import mark_boundaries
-    except Exception as e:
-        print("[INFO] LIME not installed; skipping LIME visualizations.")
+    except Exception:
+        print("[INFO] LIME not installed; skipping.")
         return
+
     os.makedirs(outdir, exist_ok=True)
 
     if device is None:
         device = next(model.parameters()).device
 
+    # Collect ONE image per class
+    samples = {}   # class_idx -> image_numpy
+    for xb, yb in loader:
+        for img, label in zip(xb, yb):
+            label = int(label)
+            if label not in samples:
+                samples[label] = denorm_to_numpy(img)
+            if len(samples) == len(class_names):
+                break
+        if len(samples) == len(class_names):
+            break
+
+    print(f"Collected {len(samples)} class samples for LIME.")
+
     model.eval()
+
     def predict_fn(np_imgs):
-        # np_imgs: (N, H, W, 3) in [0,255]
         t_list = []
         for x in np_imgs:
             t = transforms.ToTensor()(Image.fromarray(x.astype(np.uint8)))
             t = transforms.Normalize(
-                mean=[0.485,0.456,0.406], 
+                mean=[0.485,0.456,0.406],
                 std=[0.229,0.224,0.225]
             )(t)
             t_list.append(t)
         batch = torch.stack(t_list).to(device)
         with torch.no_grad():
-            logits = model(batch)
-            probs = F.softmax(logits, dim=1).cpu().numpy()
-        return probs
+            return nn_func.softmax(model(batch), dim=1).cpu().numpy()
 
     explainer = lime_image.LimeImageExplainer()
-    picked = 0
-    for xb, yb in loader:
-        for i in range(xb.size(0)):
-            if picked >= num_images:
-                break
-            img_np = denorm_to_numpy(xb[i])  # [H,W,3], uint8
-            explanation = explainer.explain_instance(
-                img_np,
-                predict_fn,
-                top_labels=1,
-                hide_color=0,
-                num_samples=1000
-            )
-            top_label = explanation.top_labels[0]
-            temp, mask = explanation.get_image_and_mask(
-                label=top_label, positive_only=True, 
-                hide_rest=False, num_features=8, min_weight=0.0
-            )
-            plt.figure(figsize=(10,4))
-            plt.subplot(1,2,1); plt.imshow(img_np); plt.axis("off"); plt.title("Image")
-            plt.subplot(1,2,2); plt.imshow(mark_boundaries(temp/255.0, mask)); plt.axis("off"); plt.title(f"LIME Top: {class_names[top_label]}")
-            plt.tight_layout()
-            plt.savefig(os.path.join(outdir, f"lime_{picked}.png"))
-            plt.close()
-            picked += 1
-        if picked >= num_images:
-            break
 
-# MAIN
+    for class_idx, img_np in samples.items():
+        explanation = explainer.explain_instance(
+            img_np,
+            predict_fn,
+            labels=[class_idx],
+            hide_color=0,
+            num_samples=1000
+        )
+
+        temp, mask = explanation.get_image_and_mask(
+            label=class_idx,
+            positive_only=True,
+            hide_rest=False,
+            num_features=8,
+            min_weight=0.0
+        )
+
+        plt.figure(figsize=(10,4))
+        plt.subplot(1,2,1); plt.imshow(img_np); plt.axis("off"); plt.title(f"Image ({class_names[class_idx]})")
+        plt.subplot(1,2,2); plt.imshow(mark_boundaries(temp/255.0, mask)); plt.axis("off")
+        plt.title(f"LIME - {class_names[class_idx]}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, f"lime_{class_names[class_idx]}.png"))
+        plt.close()
+
+# LOAD TRAINED MODEL
+def load_trained_model(cfg: Config, device, num_classes: int):
+    model = EfficientNetB0Classifier(
+        num_classes=num_classes,
+        dropout=cfg.dropout,
+        label_smoothing=cfg.label_smoothing
+    ).to(device)
+
+    model_path = os.path.join(cfg.outputs, "best_model.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"No trained model found at: {model_path}")
+
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    print("Loaded trained model:", model_path)
+    return model
+
+# MAIN TRAINING PIPELINE
 def main(cfg: Config):
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -539,15 +609,17 @@ def main(cfg: Config):
         criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=cfg.lr, 
+        model.parameters(),
+        lr=cfg.lr,
         weight_decay=cfg.weight_decay
     )
 
     if cfg.scheduler == "onecycle":
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=cfg.lr, steps_per_epoch=steps_per_epoch, epochs=cfg.epochs
+            optimizer, max_lr=cfg.lr,
+            steps_per_epoch=steps_per_epoch,
+            epochs=cfg.epochs
         )
     else:
         scheduler = None
@@ -559,13 +631,17 @@ def main(cfg: Config):
     wait = 0
     history = {
         "train_loss": [], "val_loss": [],
-        "train_acc":  [], "val_acc":  []
+        "train_acc": [], "val_acc": []
     }
 
     for epoch in range(1, cfg.epochs + 1):
         print(f"\nEpoch {epoch}/{cfg.epochs}")
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, device, criterion, scheduler)
-        val_loss, val_acc, _, _ = eval_one_epoch(model, val_loader, device, criterion)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_loader, optimizer, device, criterion, scheduler
+        )
+        val_loss, val_acc, _, _ = eval_one_epoch(
+            model, val_loader, device, criterion
+        )
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(tr_acc)
@@ -594,27 +670,95 @@ def main(cfg: Config):
         torch.save(model.state_dict(), os.path.join(cfg.outputs, "best_model.pth"))
 
     # Final test evaluation
-    test_loss, test_acc, test_logits, test_targets = eval_one_epoch(model, test_loader, device, criterion)
+    test_loss, test_acc, test_logits, test_targets = eval_one_epoch(
+        model, test_loader, device, criterion
+    )
     print(f"\nTest loss {test_loss:.4f} acc {test_acc:.4f}")
     full_evaluation(test_logits, test_targets, class_names, cfg.outputs)
 
     # Grad-CAM visualizations
-    gradcam_gallery(model, test_loader, class_names, cfg.outputs, num_images=cfg.gradcam_num_samples, device=device)
+    gradcam_gallery_all_classes(
+        model, test_loader, class_names,
+        outdir=os.path.join(CFG.outputs, "gradcam_all_classes"),
+        device=device
+    )
 
     # LIME
-    if cfg.lime_num_samples > 0:
-        lime_explain_samples(model, test_loader, class_names, cfg.outputs, num_images=cfg.lime_num_samples, device=device)
+    lime_explain_all_classes(
+        model, test_loader, class_names,
+        outdir=os.path.join(CFG.outputs, "lime_all_classes"),
+        device=device
+    )
 
     # Dump a short JSON summary
     summary = {
         "test_loss": float(test_loss),
         "test_acc": float(test_acc),
         "best_epoch": best_epoch,
-        "class_names": class_names
+        "class_names": list(class_names)
     }
     with open(os.path.join(cfg.outputs, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print("\nDone. Outputs saved in:", cfg.outputs)
 
+# MENU ENTRY POINT
 if __name__ == "__main__":
-    main(CFG)
+    print("\n====================================================")
+    print("      Skin Cancer Detection")
+    print("=====================================================")
+    print("Options:")
+    print("  1. Train the model and generate reports.")
+    print("  2. Generate reports using last trained parameters.")
+    print("======================================================")
+
+    choice = input("Enter your choice: ").strip()
+
+    if choice == "1":
+        print("\n>> Starting training mode...")
+        main(CFG)
+
+    elif choice == "2":
+        print("\n>> Running report & explainability mode using last trained model...")
+
+        # Select device
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            print("Using device: MPS (Apple GPU)")
+        else:
+            device = torch.device("cpu")
+            print("Using device: CPU")
+
+        # Build loaders (new split, but same data root)
+        _, _, test_loader, _, class_names = build_dataloaders(CFG)
+
+        # Load trained model
+        model = load_trained_model(CFG, device, num_classes=len(class_names))
+
+        # Re-evaluate on current test split for fresh metrics
+        criterion = nn.CrossEntropyLoss(label_smoothing=CFG.label_smoothing)
+        test_loss, test_acc, test_logits, test_targets = eval_one_epoch(
+            model, test_loader, device, criterion
+        )
+        print(f"\n[REPORT MODE] Test loss {test_loss:.4f} acc {test_acc:.4f}")
+        full_evaluation(test_logits, test_targets, class_names, CFG.outputs)
+
+        # Grad-CAM for all classes
+        print("\nGenerating Grad-CAM explanations for all classes...")
+        gradcam_gallery_all_classes(
+            model, test_loader, class_names,
+            outdir=os.path.join(CFG.outputs, "gradcam_all_classes"),
+            device=device
+        )
+
+        # LIME for all classes
+        print("\nGenerating LIME explanations for all classes...")
+        lime_explain_all_classes(
+            model, test_loader, class_names,
+            outdir=os.path.join(CFG.outputs, "lime_all_classes"),
+            device=device
+        )
+
+        print("\nAll reports & explanations saved in:", CFG.outputs)
+
+    else:
+        print("Invalid option. Please run again and select 1 or 2.")

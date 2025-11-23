@@ -1,13 +1,14 @@
 import os
 import json
 import copy
+import time
 import random
 from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as nn_func
@@ -33,12 +34,12 @@ class Config:
     outputs: str = "./outputs"
     img_size: int = 224
     batch_size: int = 32
-    num_workers: int = 4
-    epochs: int = 30
-    patience: int = 5
-    lr: float = 3e-4
+    num_workers: int = 2
+    epochs: int = 40
+    patience: int = 10
+    lr: float = 1e-4
     weight_decay: float = 1e-4
-    label_smoothing: float = 0.05
+    label_smoothing: float = 0.02
     dropout: float = 0.3
     seed: int = 42
     model_name: str = "efficientnet_b0"
@@ -46,7 +47,7 @@ class Config:
     train_split: float = 0.7
     val_split: float = 0.15
     test_split: float = 0.15
-    use_class_weights: bool = False
+    use_class_weights: bool = True
     save_best_model: bool = True
 
 CFG = Config()
@@ -65,8 +66,15 @@ def get_transforms(img_size: int):
     train_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),  # small rotation only
-        transforms.ColorJitter(brightness=0.05, contrast=0.05),
+        transforms.RandomVerticalFlip(p=0.2),
+        transforms.RandomRotation(15),
+        transforms.RandomResizedCrop(img_size, scale=(0.9, 1.0)),
+        transforms.ColorJitter(
+            brightness=0.1,
+            contrast=0.1,
+            saturation=0.05,
+            hue=0.02
+        ),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
@@ -301,22 +309,43 @@ def full_evaluation(logits: torch.Tensor, targets: torch.Tensor, class_names: Li
     df = pd.DataFrame(report).transpose()
     df.to_csv(os.path.join(outdir, "results_table.csv"))
 
-    # Confusion matrix
+    # Confusion matrix (Normalized + Bright + Annotated)
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    plt.figure(figsize=(7, 6))
-    plt.imshow(cm, interpolation="nearest")
-    plt.title("Confusion Matrix")
-    plt.colorbar()
-    tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=45)
-    plt.yticks(tick_marks, class_names)
-    cm_sum = cm.sum(axis=1, keepdims=True)
-    cm_norm = cm / np.clip(cm_sum, 1, None)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(j, i, f"{cm_norm[i, j]:.2f}", ha="center", va="center", fontsize=8)
-    plt.ylabel("True label")
-    plt.xlabel("Predicted label")
+
+    # Normalize rows
+    cm_norm = cm.astype("float") / cm.sum(axis=1, keepdims=True)
+
+    plt.figure(figsize=(9, 7))
+
+    sns.heatmap(
+        cm_norm,
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",  # bright, high-contrast colormap
+        vmin=0,
+        vmax=1,
+        linewidths=0.5,
+        linecolor="gray",
+        cbar=True
+    )
+
+    plt.title("Normalized Confusion Matrix", fontsize=14)
+    plt.xlabel("Predicted Label", fontsize=12)
+    plt.ylabel("True Label", fontsize=12)
+
+    plt.xticks(
+        ticks=np.arange(len(class_names)) + 0.5,
+        labels=class_names,
+        rotation=45,
+        ha="right"
+    )
+
+    plt.yticks(
+        ticks=np.arange(len(class_names)) + 0.5,
+        labels=class_names,
+        rotation=0
+    )
+
     plt.tight_layout()
     plt.savefig(os.path.join(outdir, "confusion_matrix.png"))
     plt.close()
@@ -581,9 +610,18 @@ def load_trained_model(cfg: Config, device, num_classes: int):
     print("Loaded trained model:", model_path)
     return model
 
+def format_time(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
 # MAIN TRAINING PIPELINE
 def main(cfg: Config):
-    if torch.backends.mps.is_available():
+    # Device selection: CUDA → MPS → CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using device: CUDA (NVIDIA GPU)")
+    elif torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using device: MPS (Apple GPU)")
     else:
@@ -634,7 +672,12 @@ def main(cfg: Config):
         "train_acc": [], "val_acc": []
     }
 
+    start_time = time.time()
+    print("\nTraining Started!")
+
     for epoch in range(1, cfg.epochs + 1):
+        epoch_start = time.time()
+
         print(f"\nEpoch {epoch}/{cfg.epochs}")
         tr_loss, tr_acc = train_one_epoch(
             model, train_loader, optimizer, device, criterion, scheduler
@@ -642,11 +685,16 @@ def main(cfg: Config):
         val_loss, val_acc, _, _ = eval_one_epoch(
             model, val_loader, device, criterion
         )
+
+        epoch_time = time.time() - epoch_start
+
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(tr_acc)
         history["val_acc"].append(val_acc)
+
         print(f"  train loss {tr_loss:.4f} acc {tr_acc:.4f} | val loss {val_loss:.4f} acc {val_acc:.4f}")
+        print(f"Epoch elapsed: {epoch_time:.2f} sec ({epoch_time / 60:.2f} min)")
 
         # Early stopping
         if val_loss < best_val_loss - 1e-4:
@@ -659,6 +707,11 @@ def main(cfg: Config):
             if wait >= patience:
                 print("Early stopping.")
                 break
+
+    elapsed = time.time() - start_time
+
+    print("\nTraining Completed!")
+    print(f"Total training elapsed: {format_time(elapsed)}")
 
     # Save curves + params table
     plot_training_curves(history, cfg.outputs)
@@ -720,8 +773,11 @@ if __name__ == "__main__":
     elif choice == "2":
         print("\n>> Running report & explainability mode using last trained model...")
 
-        # Select device
-        if torch.backends.mps.is_available():
+        # Device selection: CUDA → MPS → CPU
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print("Using device: CUDA (NVIDIA GPU)")
+        elif torch.backends.mps.is_available():
             device = torch.device("mps")
             print("Using device: MPS (Apple GPU)")
         else:
